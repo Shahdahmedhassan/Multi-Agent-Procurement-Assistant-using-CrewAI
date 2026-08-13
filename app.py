@@ -2,62 +2,11 @@ import os
 import json
 import requests
 from datetime import datetime
+from typing import Type
 
 import streamlit as st
 from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field
-from typing import Type
-
-# ----------------------------------------------------------------------
-# FIX: CrewAI + Groq + LiteLLM cache_breakpoint compatibility issue
-# Groq rejects the cache_breakpoint field added to messages.
-# ----------------------------------------------------------------------
-
-import litellm
-
-# Disable LiteLLM caching
-litellm.cache = None
-litellm.drop_params = True
-
-# Save the original completion function
-_real_completion = litellm.completion
-
-
-def _completion_no_cache_breakpoint(*args, **kwargs):
-    """
-    Remove cache_breakpoint from messages before sending
-    the request to Groq.
-    """
-
-    # Disable caching for this request
-    kwargs["caching"] = False
-
-    messages = kwargs.get("messages", [])
-
-    for message in messages:
-        if isinstance(message, dict):
-
-            # Remove cache_breakpoint from the message itself
-            message.pop("cache_breakpoint", None)
-
-            # Remove cache_breakpoint from content blocks
-            content = message.get("content")
-
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict):
-                        block.pop("cache_breakpoint", None)
-
-    return _real_completion(*args, **kwargs)
-
-
-# Apply the patch before CrewAI creates/uses the LLM
-litellm.completion = _completion_no_cache_breakpoint
-
-
-# ----------------------------------------------------------------------
-# CrewAI / Tools imports
-# ----------------------------------------------------------------------
 
 from crewai import Agent, Task, Crew, Process, LLM
 from crewai.tools import BaseTool
@@ -83,7 +32,7 @@ st.caption(
 
 
 # ----------------------------------------------------------------------
-# 2) Sidebar: API Keys (Free) + Company & Request Details
+# 2) Sidebar: API Keys + Company & Request Details
 # ----------------------------------------------------------------------
 
 with st.sidebar:
@@ -97,19 +46,26 @@ with st.sidebar:
         "[app.tavily.com](https://app.tavily.com)"
     )
 
+    # Safely read Streamlit secrets
+    try:
+        default_groq_key = st.secrets.get("GROQ_API_KEY", "")
+    except Exception:
+        default_groq_key = ""
+
+    try:
+        default_tavily_key = st.secrets.get("TAVILY_API_KEY", "")
+    except Exception:
+        default_tavily_key = ""
+
     groq_key = st.text_input(
         "GROQ_API_KEY",
-        value=st.secrets.get("GROQ_API_KEY", "")
-        if hasattr(st, "secrets")
-        else "",
+        value=default_groq_key,
         type="password",
     )
 
     tavily_key = st.text_input(
         "TAVILY_API_KEY",
-        value=st.secrets.get("TAVILY_API_KEY", "")
-        if hasattr(st, "secrets")
-        else "",
+        value=default_tavily_key,
         type="password",
     )
 
@@ -160,7 +116,7 @@ with st.sidebar:
 
 
 # ----------------------------------------------------------------------
-# 3) Tools (Fully Free)
+# 3) Tavily Search Tool
 # ----------------------------------------------------------------------
 
 class TavilySearchInput(BaseModel):
@@ -186,35 +142,44 @@ class TavilySearchTool(BaseTool):
 
     def _run(self, query: str) -> str:
 
-        client = TavilyClient(
-            api_key=self.tavily_api_key
-        )
+        try:
 
-        results = client.search(
-            query=query,
-            search_depth="advanced",
-            max_results=5
-        )
-
-        formatted = []
-
-        for r in results.get("results", []):
-
-            formatted.append(
-                f"- Title: {r.get('title')}\n"
-                f"  URL: {r.get('url')}\n"
-                f"  Snippet: {r.get('content')[:400]}"
+            client = TavilyClient(
+                api_key=self.tavily_api_key
             )
 
-        return (
-            "\n\n".join(formatted)
-            if formatted
-            else "No results found."
-        )
+            results = client.search(
+                query=query,
+                search_depth="advanced",
+                max_results=5
+            )
+
+            formatted = []
+
+            for r in results.get("results", []):
+
+                content = r.get("content", "")
+
+                formatted.append(
+                    f"- Title: {r.get('title', 'Unknown')}\n"
+                    f"  URL: {r.get('url', 'N/A')}\n"
+                    f"  Snippet: {content[:400]}"
+                )
+
+            if formatted:
+                return "\n\n".join(formatted)
+
+            return "No results found."
+
+        except Exception as e:
+
+            return (
+                f"Tavily search failed: {str(e)}"
+            )
 
 
 # ----------------------------------------------------------------------
-# Simple Web Scraper
+# 4) Simple Web Scraper
 # ----------------------------------------------------------------------
 
 class SimpleScrapeInput(BaseModel):
@@ -251,6 +216,8 @@ class SimpleScraperTool(BaseTool):
                 timeout=15
             )
 
+            resp.raise_for_status()
+
             soup = BeautifulSoup(
                 resp.text,
                 "html.parser"
@@ -272,12 +239,12 @@ class SimpleScraperTool(BaseTool):
         except Exception as e:
 
             return (
-                f"Failed to extract data from {url}: {e}"
+                f"Failed to extract data from {url}: {str(e)}"
             )
 
 
 # ----------------------------------------------------------------------
-# 4) Crew Setup and Execution
+# 5) Crew Setup and Execution
 # ----------------------------------------------------------------------
 
 def run_crew(
@@ -286,8 +253,26 @@ def run_crew(
     tavily_key: str
 ):
 
-    # Set Groq API key
-    os.environ["GROQ_API_KEY"] = groq_key
+    # --------------------------------------------------------------
+    # Validate API Keys
+    # --------------------------------------------------------------
+
+    if not groq_key or not groq_key.strip():
+        raise ValueError(
+            "GROQ_API_KEY is missing."
+        )
+
+    if not tavily_key or not tavily_key.strip():
+        raise ValueError(
+            "TAVILY_API_KEY is missing."
+        )
+
+    # --------------------------------------------------------------
+    # Set environment variables
+    # --------------------------------------------------------------
+
+    os.environ["GROQ_API_KEY"] = groq_key.strip()
+    os.environ["TAVILY_API_KEY"] = tavily_key.strip()
 
     # --------------------------------------------------------------
     # LLM
@@ -295,7 +280,9 @@ def run_crew(
 
     llm = LLM(
         model="groq/llama-3.3-70b-versatile",
-        temperature=0.3
+        api_key=groq_key.strip(),
+        temperature=0.3,
+        max_tokens=2048,
     )
 
     # --------------------------------------------------------------
@@ -303,7 +290,7 @@ def run_crew(
     # --------------------------------------------------------------
 
     search_tool = TavilySearchTool(
-        tavily_api_key=tavily_key
+        tavily_api_key=tavily_key.strip()
     )
 
     scrape_tool = SimpleScraperTool()
@@ -344,8 +331,8 @@ def run_crew(
         role="Data Collection Specialist",
 
         goal=(
-            "Extract precise data (price, specifications, "
-            "warranty) from product pages."
+            "Extract precise data including price, specifications, "
+            "and warranty from product pages."
         ),
 
         backstory=(
@@ -372,7 +359,7 @@ def run_crew(
 
         goal=(
             "Compare and rank products based on price, "
-            "specifications, and overall value."
+            "specifications, warranty, and overall value."
         ),
 
         backstory=(
@@ -435,12 +422,15 @@ def run_crew(
             "Search for at least 5 products matching the "
             "specifications from different sources. "
 
-            "Collect the product name, URL, and source."
+            "Collect the product name, URL, and source. "
+
+            "Focus on real products and real suppliers. "
+            "Do not invent product information."
         ),
 
         expected_output=(
             "A list of at least 5 products, each containing "
-            "a title, URL, and source."
+            "a title, URL, source, and a short description."
         ),
 
         agent=search_agent,
@@ -455,11 +445,14 @@ def run_crew(
         description=(
             "From the product links provided by the Search Agent, "
             "extract the current price, specifications, and "
-            "warranty period (if available) for each product."
+            "warranty period if available for each product. "
+
+            "If information is unavailable, explicitly say "
+            "'Not available' instead of inventing information."
         ),
 
         expected_output=(
-            "A structured data layout for each product: "
+            "A structured data layout for each product containing: "
             "Name, Price, Specifications, Warranty, and URL."
         ),
 
@@ -475,19 +468,27 @@ def run_crew(
     analysis_task = Task(
 
         description=(
+
             f"Compare the products based on company priorities: "
             f"{company_context['priority_order']} "
 
             f"and budget: "
             f"{company_context['budget_per_unit_usd']} USD per unit. "
 
-            "Rank the products from best to lowest value "
-            "with justification."
+            "Rank the products from best to lowest value. "
+
+            "Consider the required specifications, price, "
+            "warranty, and brand reputation. "
+
+            "Clearly explain why the first-ranked product "
+            "is recommended. "
+
+            "Do not invent missing data."
         ),
 
         expected_output=(
             "A final ranking of products with a brief rationale "
-            "for each ranking."
+            "for each ranking and a clear final recommendation."
         ),
 
         agent=analyst_agent,
@@ -502,15 +503,26 @@ def run_crew(
     report_task = Task(
 
         description=(
-            "Write a complete final Procurement report in full "
-            "HTML format (including <html><head><body>), "
 
-            "incorporating: Title, Executive Summary, "
-            "Comparison Table, Final Recommendation with Rationale, "
-            "and Date. "
+            "Write a complete final Procurement report in full "
+            "HTML format including <html>, <head>, and <body>. "
+
+            "The report must contain: "
+
+            "1. Title "
+            "2. Executive Summary "
+            "3. Company Requirements "
+            "4. Comparison Table "
+            "5. Final Ranking "
+            "6. Final Recommendation with Rationale "
+            "7. Procurement Notes "
+            "8. Date "
 
             "Use clean inline CSS inside <style> "
-            "for a professional layout."
+            "for a professional business layout. "
+
+            "Use only information available in the previous tasks. "
+            "Do not invent prices, specifications, or warranties."
         ),
 
         expected_output=(
@@ -547,12 +559,60 @@ def run_crew(
         verbose=True,
     )
 
-    # Run CrewAI
-    return crew.kickoff()
+    # --------------------------------------------------------------
+    # Run Crew
+    # --------------------------------------------------------------
+
+    try:
+
+        result = crew.kickoff()
+
+        return result
+
+    except Exception as e:
+
+        error_text = str(e)
+
+        # Make the most common errors easier to understand
+
+        if "401" in error_text or "invalid_api_key" in error_text.lower():
+
+            raise RuntimeError(
+                "❌ Groq API key is invalid or expired. "
+                "Create a new key from Groq Console and paste it "
+                "into GROQ_API_KEY."
+            ) from e
+
+        if "403" in error_text:
+
+            raise RuntimeError(
+                "❌ Groq rejected the request (403). "
+                "Check your Groq project/model permissions."
+            ) from e
+
+        if "429" in error_text or "rate limit" in error_text.lower():
+
+            raise RuntimeError(
+                "❌ Groq rate limit reached. "
+                "Wait a little and try again."
+            ) from e
+
+        if "BadRequestError" in error_text:
+
+            raise RuntimeError(
+                "❌ Groq rejected the request as a Bad Request. "
+                "Check the API key and try again. "
+                f"\n\nOriginal error: {error_text}"
+            ) from e
+
+        raise RuntimeError(
+            f"❌ CrewAI failed while running the agents.\n\n"
+            f"{error_text}"
+        ) from e
 
 
 # ----------------------------------------------------------------------
-# 5) Main Page Logic
+# 6) Main Page Logic
 # ----------------------------------------------------------------------
 
 if run_button:
@@ -599,25 +659,40 @@ if run_button:
         # Run Agents
         # ----------------------------------------------------------
 
-        with st.status(
-            "🤖 Agents at work... This may take about a minute.",
-            expanded=True
-        ) as status:
+        try:
 
-            st.write(
-                "🔍 Search Agent is looking for products..."
+            with st.status(
+                "🤖 Agents at work... This may take about a minute.",
+                expanded=True
+            ) as status:
+
+                st.write(
+                    "🔍 Search Agent is looking for products..."
+                )
+
+                result = run_crew(
+                    company_context,
+                    groq_key,
+                    tavily_key
+                )
+
+                status.update(
+                    label="✅ Report is ready!",
+                    state="complete"
+                )
+
+        except Exception as e:
+
+            st.error(
+                "The application could not complete the request."
             )
 
-            result = run_crew(
-                company_context,
-                groq_key,
-                tavily_key
+            st.code(
+                str(e),
+                language="text"
             )
 
-            status.update(
-                label="✅ Report is ready!",
-                state="complete"
-            )
+            st.stop()
 
         # ----------------------------------------------------------
         # Clean HTML Output
@@ -629,8 +704,17 @@ if run_button:
 
             html_output = (
                 html_output
-                .split("```html")[1]
-                .split("```")[0]
+                .split("```html", 1)[1]
+                .split("```", 1)[0]
+                .strip()
+            )
+
+        elif "```HTML" in html_output:
+
+            html_output = (
+                html_output
+                .split("```HTML", 1)[1]
+                .split("```", 1)[0]
                 .strip()
             )
 
@@ -638,8 +722,8 @@ if run_button:
 
             html_output = (
                 html_output
-                .split("```")[1]
-                .split("```")[0]
+                .split("```", 1)[1]
+                .split("```", 1)[0]
                 .strip()
             )
 
@@ -665,15 +749,10 @@ if run_button:
         )
 
         st.download_button(
-
             "⬇️ Download Report (HTML)",
-
             data=html_output,
-
             file_name=filename,
-
             mime="text/html",
-
             use_container_width=True,
         )
 
