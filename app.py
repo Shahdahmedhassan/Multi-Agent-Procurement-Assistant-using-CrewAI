@@ -11,9 +11,9 @@ from crewai import Agent, Task, Crew, Process, LLM
 from tavily import TavilyClient
 
 
-# ----------------------------------------------------------------------
-# 1) Page Configuration
-# ----------------------------------------------------------------------
+# ==============================================================
+# 1) PAGE CONFIGURATION
+# ==============================================================
 
 st.set_page_config(
     page_title="Multi-Agent Procurement Assistant",
@@ -29,9 +29,9 @@ st.caption(
 )
 
 
-# ----------------------------------------------------------------------
-# 2) Sidebar
-# ----------------------------------------------------------------------
+# ==============================================================
+# 2) SIDEBAR
+# ==============================================================
 
 with st.sidebar:
 
@@ -39,10 +39,14 @@ with st.sidebar:
 
     st.markdown(
         "- **Groq:** get a key from "
-        "[console.groq.com/keys](https://console.groq.com/keys)\n"
+        "[console.groq.com/keys](https://console.groq.com/keys)\n\n"
         "- **Tavily:** get a key from "
-        "[app.tavily.com](https://app.tavily.com)"
+        "[app.tavily.com](https://app.tavily.com/)"
     )
+
+    # ----------------------------------------------------------
+    # Read Streamlit Secrets safely
+    # ----------------------------------------------------------
 
     try:
         secret_groq = st.secrets.get("GROQ_API_KEY", "")
@@ -64,6 +68,10 @@ with st.sidebar:
     )
 
     st.divider()
+
+    # ----------------------------------------------------------
+    # Company Details
+    # ----------------------------------------------------------
 
     st.header("🏢 Company & Order Details")
 
@@ -112,11 +120,14 @@ with st.sidebar:
     )
 
 
-# ----------------------------------------------------------------------
-# 3) Tavily Search
-# ----------------------------------------------------------------------
+# ==============================================================
+# 3) TAVILY PRODUCT SEARCH
+# ==============================================================
 
-def search_products(tavily_key: str, company_context: dict) -> list:
+def search_products(
+    tavily_key: str,
+    company_context: dict,
+) -> list:
 
     client = TavilyClient(api_key=tavily_key)
 
@@ -127,8 +138,9 @@ def search_products(tavily_key: str, company_context: dict) -> list:
     query = (
         f"{company_context['procurement_need']} "
         f"business laptop "
-        f"under ${company_context['budget_per_unit_usd']} "
-        f"{specs}"
+        f"budget under ${company_context['budget_per_unit_usd']} "
+        f"{specs} "
+        f"buy online"
     )
 
     response = client.search(
@@ -143,14 +155,26 @@ def search_products(tavily_key: str, company_context: dict) -> list:
     for item in response.get("results", []):
 
         url = item.get("url", "")
-        title = item.get("title", "Unknown product")
-        content = item.get("content", "")
+
+        title = item.get(
+            "title",
+            "Unknown product",
+        )
+
+        content = item.get(
+            "content",
+            "",
+        )
 
         if not url:
             continue
 
         try:
-            source = url.split("/")[2]
+            source = (
+                url.split("/")[2]
+                if "://" in url
+                else "Unknown"
+            )
         except Exception:
             source = "Unknown"
 
@@ -159,17 +183,16 @@ def search_products(tavily_key: str, company_context: dict) -> list:
                 "title": title,
                 "url": url,
                 "source": source,
-                # Keep Tavily content SHORT
-                "snippet": content[:600],
+                "snippet": content[:900],
             }
         )
 
     return products
 
 
-# ----------------------------------------------------------------------
-# 4) Product Page Scraper
-# ----------------------------------------------------------------------
+# ==============================================================
+# 4) PRODUCT PAGE SCRAPER
+# ==============================================================
 
 def scrape_product_page(url: str) -> str:
 
@@ -178,7 +201,8 @@ def scrape_product_page(url: str) -> str:
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 Chrome/131 Safari/537.36"
+                "AppleWebKit/537.36 "
+                "Chrome/131.0.0.0 Safari/537.36"
             )
         }
 
@@ -213,20 +237,23 @@ def scrape_product_page(url: str) -> str:
             ).split()
         )
 
-        # VERY IMPORTANT:
-        # Keep page text small to protect Groq TPM.
-        return text[:1000]
+        # Keep the page context small.
+        return text[:2500]
 
     except Exception as exc:
 
-        return f"Page could not be read: {str(exc)[:150]}"
+        return (
+            f"Could not scrape page: {str(exc)[:300]}"
+        )
 
 
-# ----------------------------------------------------------------------
-# 5) Collect Product Data
-# ----------------------------------------------------------------------
+# ==============================================================
+# 5) COLLECT PRODUCT DATA
+# ==============================================================
 
-def collect_product_data(products: list) -> list:
+def collect_product_data(
+    products: list,
+) -> list:
 
     collected = []
 
@@ -241,17 +268,25 @@ def collect_product_data(products: list) -> list:
                 "name": product["title"],
                 "url": product["url"],
                 "source": product["source"],
-                "search_snippet": product["snippet"][:500],
-                "page_text": page_text[:1000],
+                "search_snippet": product["snippet"],
+                "page_text": page_text,
             }
         )
 
     return collected
 
 
-# ----------------------------------------------------------------------
-# 6) Create Groq LLM
-# ----------------------------------------------------------------------
+# ==============================================================
+# 6) CREATE CREWAI LLM
+#
+# IMPORTANT:
+# Do NOT add max_iter here.
+#
+# max_iter is NOT a Groq API parameter.
+# Adding it to LLM() can cause:
+#
+# property 'max_iter' is unsupported
+# ==============================================================
 
 def create_llm(groq_key: str) -> LLM:
 
@@ -260,118 +295,14 @@ def create_llm(groq_key: str) -> LLM:
     return LLM(
         model="groq/llama-3.1-8b-instant",
         api_key=groq_key,
-
-        # Low temperature = more stable output
         temperature=0.1,
-
-        # Keep completion small
-        max_tokens=1200,
-
-        # Avoid excessive agent iterations
-        max_iter=1,
+        max_tokens=700,
     )
 
 
-# ----------------------------------------------------------------------
-# 7) Run LLM With Simple Retry
-# ----------------------------------------------------------------------
-
-def run_crew_with_retry(
-    crew,
-    max_attempts=3,
-):
-
-    for attempt in range(max_attempts):
-
-        try:
-
-            return crew.kickoff()
-
-        except Exception as exc:
-
-            error_text = str(exc).lower()
-
-            rate_limit = (
-                "rate limit" in error_text
-                or "ratelimit" in error_text
-                or "tokens per minute" in error_text
-                or "429" in error_text
-            )
-
-            if not rate_limit:
-                raise
-
-            if attempt == max_attempts - 1:
-                raise
-
-            # Wait between retries.
-            wait_seconds = 35
-
-            st.warning(
-                f"⏳ Groq rate limit reached. "
-                f"Waiting {wait_seconds} seconds before retry "
-                f"({attempt + 1}/{max_attempts - 1})..."
-            )
-
-            time.sleep(wait_seconds)
-
-    return None
-
-
-# ----------------------------------------------------------------------
-# 8) Build Compact Research Context
-# ----------------------------------------------------------------------
-
-def build_compact_context(
-    company_context: dict,
-    research_data: list,
-) -> str:
-
-    compact_products = []
-
-    for item in research_data:
-
-        compact_products.append(
-            {
-                "product": item["name"],
-                "source": item["source"],
-                "url": item["url"],
-                "evidence": (
-                    item["search_snippet"]
-                    + " "
-                    + item["page_text"]
-                )[:1300],
-            }
-        )
-
-    data = {
-        "company": company_context["company_name"],
-        "product_needed": company_context["procurement_need"],
-        "quantity": company_context["quantity"],
-        "budget_usd": company_context["budget_per_unit_usd"],
-        "requirements": company_context["must_have_specs"],
-        "priorities": company_context["priority_order"],
-        "products": compact_products,
-    }
-
-    return json.dumps(
-        data,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-
-
-# ----------------------------------------------------------------------
-# 9) CrewAI Workflow
-#
-# IMPORTANT:
-# Only TWO LLM calls are made:
-#
-# Call 1 -> Research Agent
-# Call 2 -> Report Agent
-#
-# Ranking/analysis is handled with Python.
-# ----------------------------------------------------------------------
+# ==============================================================
+# 7) RUN CREW
+# ==============================================================
 
 def run_crew(
     company_context: dict,
@@ -381,27 +312,55 @@ def run_crew(
 
     llm = create_llm(groq_key)
 
-    compact_context = build_compact_context(
+    # ----------------------------------------------------------
+    # Keep data small to reduce Groq TPM usage
+    # ----------------------------------------------------------
+
+    compact_data = []
+
+    for item in research_data[:5]:
+
+        compact_data.append(
+            {
+                "name": item["name"],
+                "url": item["url"],
+                "source": item["source"],
+                "search_snippet": item[
+                    "search_snippet"
+                ][:500],
+                "page_text": item[
+                    "page_text"
+                ][:1200],
+            }
+        )
+
+    context_json = json.dumps(
         company_context,
-        research_data,
+        ensure_ascii=False,
     )
 
-    # ==============================================================
-    # AGENT 1 - RESEARCH
-    # ==============================================================
+    research_json = json.dumps(
+        compact_data,
+        ensure_ascii=False,
+    )
+
+    # ==========================================================
+    # AGENT 1
+    # ==========================================================
 
     research_agent = Agent(
         role="Procurement Research Specialist",
 
         goal=(
-            "Extract only useful factual product information "
-            "from the supplied evidence."
+            "Organize product evidence into a factual shortlist. "
+            "Never invent prices, specifications, warranty details, "
+            "or product information."
         ),
 
         backstory=(
-            "You are a careful procurement researcher. "
-            "You never invent prices, specifications, warranties "
-            "or product facts."
+            "You are an experienced procurement researcher. "
+            "You carefully distinguish verified facts from missing "
+            "information."
         ),
 
         llm=llm,
@@ -409,115 +368,185 @@ def run_crew(
         verbose=False,
 
         allow_delegation=False,
-
-        max_iter=1,
     )
+
+    # ==========================================================
+    # AGENT 2
+    # ==========================================================
+
+    analyst_agent = Agent(
+        role="Procurement Analyst",
+
+        goal=(
+            "Compare products against company requirements and "
+            "rank them according to price, specifications, warranty, "
+            "and business value."
+        ),
+
+        backstory=(
+            "You are a professional procurement analyst. "
+            "You make practical purchasing recommendations using "
+            "only available evidence."
+        ),
+
+        llm=llm,
+
+        verbose=False,
+
+        allow_delegation=False,
+    )
+
+    # ==========================================================
+    # AGENT 3
+    # ==========================================================
+
+    report_agent = Agent(
+        role="Procurement Report Writer",
+
+        goal=(
+            "Create a concise professional procurement report in "
+            "complete HTML."
+        ),
+
+        backstory=(
+            "You are an executive business report writer who "
+            "converts procurement analysis into clear reports "
+            "for management."
+        ),
+
+        llm=llm,
+
+        verbose=False,
+
+        allow_delegation=False,
+    )
+
+    # ==========================================================
+    # TASK 1 - RESEARCH
+    # ==========================================================
 
     research_task = Task(
 
         description=(
-            "Analyze the supplied procurement data.\n\n"
+            "Review the company requirements and collected product "
+            "evidence below.\n\n"
 
-            f"DATA:\n{compact_context}\n\n"
+            f"COMPANY REQUIREMENTS:\n"
+            f"{context_json}\n\n"
 
-            "Return a SHORT factual shortlist.\n"
+            f"PRODUCT EVIDENCE:\n"
+            f"{research_json}\n\n"
+
+            "Create a factual shortlist of up to 5 products.\n\n"
 
             "For every product provide:\n"
             "- Product name\n"
             "- Source\n"
             "- URL\n"
             "- Price if explicitly available\n"
-            "- Important specifications if explicitly available\n"
+            "- Key specifications if explicitly available\n"
             "- Warranty if explicitly available\n"
             "- Missing information\n\n"
 
-            "Never invent information.\n"
-            "Keep the response under 900 words."
+            "IMPORTANT:\n"
+            "Do not invent information. "
+            "If something cannot be verified, write "
+            "'Not verified'."
         ),
 
         expected_output=(
-            "A concise factual product shortlist."
+            "A concise factual shortlist of up to 5 products "
+            "with verified evidence and missing information."
         ),
 
         agent=research_agent,
     )
 
-    # ==============================================================
-    # AGENT 2 - REPORT WRITER
-    # ==============================================================
+    # ==========================================================
+    # TASK 2 - ANALYSIS
+    # ==========================================================
 
-    report_agent = Agent(
-        role="Procurement Report Writer",
+    analysis_task = Task(
 
-        goal=(
-            "Create a concise professional procurement report "
-            "from verified research evidence."
+        description=(
+            "Analyze the research shortlist from the previous task.\n\n"
+
+            f"COMPANY REQUIREMENTS:\n"
+            f"{context_json}\n\n"
+
+            f"PRIORITIES:\n"
+            f"{company_context['priority_order']}\n\n"
+
+            f"BUDGET PER UNIT:\n"
+            f"${company_context['budget_per_unit_usd']}\n\n"
+
+            "Rank the products from best to worst.\n\n"
+
+            "For each product explain briefly:\n"
+            "- Whether it appears to meet the requirements\n"
+            "- Price suitability\n"
+            "- Specification suitability\n"
+            "- Warranty suitability\n"
+            "- Main advantage\n"
+            "- Main concern\n\n"
+
+            "Clearly mark any product where important information "
+            "could not be verified.\n\n"
+
+            "Do not invent facts."
         ),
 
-        backstory=(
-            "You are an executive procurement report writer. "
-            "You clearly distinguish verified information "
-            "from missing information."
+        expected_output=(
+            "A concise ranked procurement analysis containing "
+            "a recommended product and alternatives."
         ),
 
-        llm=llm,
+        agent=analyst_agent,
 
-        verbose=False,
-
-        allow_delegation=False,
-
-        max_iter=1,
+        context=[research_task],
     )
+
+    # ==========================================================
+    # TASK 3 - FINAL REPORT
+    # ==========================================================
 
     report_task = Task(
 
         description=(
-            "Create the final procurement report.\n\n"
+            "Create the final procurement report using the "
+            "research and analysis from the previous tasks.\n\n"
 
-            "Company:\n"
-            f"{company_context['company_name']}\n\n"
+            "The output MUST be complete HTML.\n\n"
 
-            "Product Needed:\n"
-            f"{company_context['procurement_need']}\n\n"
+            "It MUST start with:\n"
+            "<!DOCTYPE html>\n\n"
 
-            "Quantity:\n"
-            f"{company_context['quantity']}\n\n"
+            "Include:\n"
+            "1. Report title\n"
+            "2. Company information\n"
+            "3. Procurement request\n"
+            "4. Quantity\n"
+            "5. Budget per unit\n"
+            "6. Must-have specifications\n"
+            "7. Executive Summary\n"
+            "8. Product Comparison Table\n"
+            "9. Final Recommendation\n"
+            "10. Rationale\n"
+            "11. Verification Notes\n"
+            "12. Report Date\n\n"
 
-            "Budget per Unit:\n"
-            f"${company_context['budget_per_unit_usd']}\n\n"
-
-            "Required Specifications:\n"
-            f"{', '.join(company_context['must_have_specs'])}\n\n"
-
-            "Priorities:\n"
-            f"{', '.join(company_context['priority_order'])}\n\n"
-
-            "Research Evidence:\n"
-            f"{compact_context}\n\n"
-
-            "Research Summary:\n"
-            "Use the previous research task.\n\n"
-
-            "Create complete HTML beginning with <!DOCTYPE html>.\n\n"
-
-            "The HTML must contain:\n"
-            "1. Professional title\n"
-            "2. Company request summary\n"
-            "3. Executive Summary\n"
-            "4. Product comparison table\n"
-            "5. Final Recommendation\n"
-            "6. Rationale\n"
-            "7. Verification Notes\n"
-            "8. Report Date\n\n"
-
-            "Comparison table columns:\n"
+            "The comparison table must contain:\n"
             "Product | Source | Price | Specifications | "
             "Warranty | Recommendation\n\n"
 
             "Use clean inline CSS.\n"
+            "Use a professional business layout.\n"
             "Do not invent facts.\n"
-            "If information is missing, write 'Not verified'.\n"
-            "Keep the HTML concise."
+            "If information is unavailable, write "
+            "'Not verified'.\n\n"
+
+            f"Report Date: "
+            f"{datetime.now().strftime('%Y-%m-%d')}"
         ),
 
         expected_output=(
@@ -526,22 +555,24 @@ def run_crew(
 
         agent=report_agent,
 
-        context=[research_task],
+        context=[analysis_task],
     )
 
-    # ==============================================================
+    # ==========================================================
     # CREW
-    # ==============================================================
+    # ==========================================================
 
     crew = Crew(
 
         agents=[
             research_agent,
+            analyst_agent,
             report_agent,
         ],
 
         tasks=[
             research_task,
+            analysis_task,
             report_task,
         ],
 
@@ -550,15 +581,56 @@ def run_crew(
         verbose=False,
     )
 
-    return run_crew_with_retry(
-        crew,
-        max_attempts=3,
-    )
+    return crew.kickoff()
 
 
-# ----------------------------------------------------------------------
-# 10) Clean HTML
-# ----------------------------------------------------------------------
+# ==============================================================
+# 8) RETRY FUNCTION
+# ==============================================================
+
+def run_crew_with_retry(
+    company_context: dict,
+    groq_key: str,
+    research_data: list,
+):
+
+    max_attempts = 2
+
+    for attempt in range(max_attempts):
+
+        try:
+
+            return run_crew(
+                company_context,
+                groq_key,
+                research_data,
+            )
+
+        except Exception as exc:
+
+            error_text = str(exc).lower()
+
+            is_rate_limit = (
+                "rate limit" in error_text
+                or "ratelimit" in error_text
+                or "429" in error_text
+                or "tokens per minute" in error_text
+                or "tpm" in error_text
+            )
+
+            if not is_rate_limit:
+                raise
+
+            if attempt == max_attempts - 1:
+                raise
+
+            # Wait before retrying.
+            time.sleep(35)
+
+
+# ==============================================================
+# 9) CLEAN HTML
+# ==============================================================
 
 def clean_html_output(result) -> str:
 
@@ -594,20 +666,20 @@ def clean_html_output(result) -> str:
     return html_output
 
 
-# ----------------------------------------------------------------------
-# 11) Main Application
-# ----------------------------------------------------------------------
+# ==============================================================
+# 10) MAIN APPLICATION
+# ==============================================================
 
 if run_button:
 
-    # --------------------------------------------------------------
+    # ----------------------------------------------------------
     # Validate API Keys
-    # --------------------------------------------------------------
+    # ----------------------------------------------------------
 
     if not groq_key:
 
         st.error(
-            "❌ Please enter your GROQ_API_KEY."
+            "Please enter GROQ_API_KEY."
         )
 
         st.stop()
@@ -615,51 +687,43 @@ if run_button:
     if not tavily_key:
 
         st.error(
-            "❌ Please enter your TAVILY_API_KEY."
+            "Please enter TAVILY_API_KEY."
         )
 
         st.stop()
 
-    # --------------------------------------------------------------
+    # ----------------------------------------------------------
     # Build Company Context
-    # --------------------------------------------------------------
+    # ----------------------------------------------------------
 
     company_context = {
 
-        "company_name":
-            company_name,
+        "company_name": company_name,
 
-        "procurement_need":
-            procurement_need,
+        "procurement_need": procurement_need,
 
-        "quantity":
-            int(quantity),
+        "quantity": int(quantity),
 
-        "budget_per_unit_usd":
-            float(budget),
+        "budget_per_unit_usd": float(
+            budget
+        ),
 
         "must_have_specs": [
-
             item.strip()
-
             for item in must_have.splitlines()
-
             if item.strip()
         ],
 
         "priority_order": [
-
             item.strip()
-
             for item in priority.split(",")
-
             if item.strip()
         ],
     }
 
-    # --------------------------------------------------------------
+    # ----------------------------------------------------------
     # Run Workflow
-    # --------------------------------------------------------------
+    # ----------------------------------------------------------
 
     try:
 
@@ -668,9 +732,9 @@ if run_button:
             expanded=True,
         ) as status:
 
-            # ======================================================
-            # STEP 1 - TAVILY SEARCH
-            # ======================================================
+            # ==================================================
+            # STEP 1 - SEARCH
+            # ==================================================
 
             st.write(
                 "🔍 Search Agent is looking for products..."
@@ -690,8 +754,8 @@ if run_button:
 
                 st.error(
                     "Tavily returned no product results. "
-                    "Try a broader product name or check the "
-                    "Tavily API key."
+                    "Try a broader product name or check "
+                    "your Tavily API key."
                 )
 
                 st.stop()
@@ -700,9 +764,9 @@ if run_button:
                 f"✅ Found {len(products)} product sources."
             )
 
-            # ======================================================
-            # STEP 2 - SCRAPE
-            # ======================================================
+            # ==================================================
+            # STEP 2 - SCRAPING
+            # ==================================================
 
             st.write(
                 "📄 Collecting product-page information..."
@@ -712,16 +776,16 @@ if run_button:
                 products
             )
 
+            # ==================================================
+            # STEP 3 - CREWAI
+            # ==================================================
+
             st.write(
                 "🧠 CrewAI Research Agent is organizing "
                 "the evidence..."
             )
 
-            # ======================================================
-            # STEP 3 - CREWAI
-            # ======================================================
-
-            result = run_crew(
+            result = run_crew_with_retry(
                 company_context,
                 groq_key,
                 research_data,
@@ -732,13 +796,17 @@ if run_button:
                 state="complete",
             )
 
-        # ==========================================================
-        # FINAL REPORT
-        # ==========================================================
+        # ======================================================
+        # CLEAN RESULT
+        # ======================================================
 
         html_output = clean_html_output(
             result
         )
+
+        # ======================================================
+        # SHOW REPORT
+        # ======================================================
 
         st.subheader(
             "📄 Final Report"
@@ -750,9 +818,9 @@ if run_button:
             scrolling=True,
         )
 
-        # ==========================================================
-        # DOWNLOAD
-        # ==========================================================
+        # ======================================================
+        # DOWNLOAD REPORT
+        # ======================================================
 
         filename = (
             "procurement_report_"
@@ -761,19 +829,15 @@ if run_button:
 
         st.download_button(
             "⬇️ Download Report (HTML)",
-
             data=html_output,
-
             file_name=filename,
-
             mime="text/html",
-
             use_container_width=True,
         )
 
-    # --------------------------------------------------------------
+    # ==========================================================
     # ERROR HANDLING
-    # --------------------------------------------------------------
+    # ==========================================================
 
     except Exception as exc:
 
@@ -785,19 +849,43 @@ if run_button:
 
         lower_error = error_text.lower()
 
+        # ------------------------------------------------------
+        # MAX_ITER ERROR
+        # ------------------------------------------------------
+
         if (
-            "rate limit" in lower_error
-            or "ratelimit" in lower_error
-            or "tokens per minute" in lower_error
-            or "429" in lower_error
+            "max_iter" in lower_error
+            and "unsupported" in lower_error
         ):
 
             st.warning(
-                "⏳ Groq rate limit was reached. "
-                "The application was optimized to use only "
-                "two CrewAI LLM calls and smaller prompts. "
-                "Please wait about 30–40 seconds and run again."
+                "The Groq request contains an unsupported "
+                "'max_iter' parameter. Make sure the deployed "
+                "app.py is the latest version and that there is "
+                "no old LiteLLM monkey-patch in the file."
             )
+
+        # ------------------------------------------------------
+        # RATE LIMIT
+        # ------------------------------------------------------
+
+        elif (
+            "rate limit" in lower_error
+            or "ratelimit" in lower_error
+            or "429" in lower_error
+            or "tokens per minute" in lower_error
+        ):
+
+            st.warning(
+                "Groq reached its free-tier token limit. "
+                "The app has been optimized to use smaller "
+                "requests. Wait about 30–40 seconds and run "
+                "the workflow again."
+            )
+
+        # ------------------------------------------------------
+        # AUTH ERROR
+        # ------------------------------------------------------
 
         elif (
             "401" in lower_error
@@ -806,25 +894,38 @@ if run_button:
         ):
 
             st.warning(
-                "🔑 The Groq API key was rejected. "
-                "Please check GROQ_API_KEY."
+                "The Groq API key was rejected. "
+                "Check GROQ_API_KEY and make sure the complete "
+                "key was entered."
             )
+
+        # ------------------------------------------------------
+        # TAVILY ERROR
+        # ------------------------------------------------------
 
         elif "tavily" in lower_error:
 
             st.warning(
-                "🔎 The Tavily request failed. "
-                "Please check TAVILY_API_KEY."
+                "The Tavily request failed. "
+                "Check TAVILY_API_KEY and try again."
             )
+
+        # ------------------------------------------------------
+        # GENERAL ERROR
+        # ------------------------------------------------------
 
         else:
 
             st.warning(
                 "An unexpected error occurred. "
-                "Check the details below."
+                "Check the technical details below."
             )
 
         st.exception(exc)
+
+# ==============================================================
+# INITIAL PAGE
+# ==============================================================
 
 else:
 
